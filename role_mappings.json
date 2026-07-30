@@ -94,5 +94,37 @@
       "scan",
       "admin"
     ]
+  },
+
+  "_admin_users_comment": [
+    "OPTIONAL. Extra users who should administer the project regardless of what",
+    "GitHub says. Use it for the people who own the SonarQube Cloud side and are",
+    "not necessarily repository collaborators.",
+    "",
+    "'logins' holds SonarQube Cloud logins (for GitHub-authenticated users this",
+    "is usually the GitHub login, sometimes suffixed with the provider, e.g.",
+    "'jsmith@github'). Leave the list empty - or delete the whole 'admin_users'",
+    "object - to disable the feature entirely.",
+    "",
+    "Every login is checked against the organization's members exactly like a",
+    "GitHub collaborator: one that does not exist on SonarQube Cloud is reported",
+    "as skipped rather than failing the run.",
+    "",
+    "'permissions' is what each of these users receives. The default grants",
+    "Administer Project and See Source Code, plus Browse Project - without",
+    "'user' a person cannot open the project in the UI at all, which would make",
+    "the other two useless. Values must be keys of '_sqc_permissions' above.",
+    "",
+    "A login that is ALSO a GitHub collaborator keeps both sets of permissions:",
+    "the role mapping and this list are combined, never one instead of the other."
+  ],
+
+  "admin_users": {
+    "permissions": [
+      "admin",
+      "codeviewer",
+      "user"
+    ],
+    "logins": []
   }
 }

@@ -167,12 +167,16 @@ class Mappings:
     """The contents of the mapping file.
 
     `permissions` maps each SonarQube Cloud permission value to its name in the
-    SQC UI, and doubles as the set of values accepted in `roles`. `roles` maps
-    each GitHub repository role to the permissions it grants.
+    SQC UI, and doubles as the set of values accepted everywhere else. `roles`
+    maps each GitHub repository role to the permissions it grants.
+    `admin_users` is an optional list of SQC logins that receive
+    `admin_user_permissions` on top of anything their GitHub role grants.
     """
 
     permissions: dict[str, str]
     roles: dict[str, list[str]]
+    admin_users: list[str]
+    admin_user_permissions: list[str]
 
 
 def load_mappings(path: str) -> Mappings:
@@ -198,7 +202,13 @@ def load_mappings(path: str) -> Mappings:
 
     permissions = _parse_permission_catalogue(raw, path)
     roles = _parse_roles(raw, path, permissions)
-    return Mappings(permissions=permissions, roles=roles)
+    admin_users, admin_user_permissions = _parse_admin_users(raw, path, permissions)
+    return Mappings(
+        permissions=permissions,
+        roles=roles,
+        admin_users=admin_users,
+        admin_user_permissions=admin_user_permissions,
+    )
 
 
 def _parse_permission_catalogue(raw: dict, path: str) -> dict[str, str]:
@@ -230,9 +240,9 @@ def _parse_roles(
     raw: dict, path: str, valid_permissions: dict[str, str]
 ) -> dict[str, list[str]]:
     """Read `roles`, validating each permission against the catalogue."""
-    roles = raw.get("roles", raw)
+    roles = raw.get("roles")
     if not isinstance(roles, dict):
-        raise ConfigError(f"'roles' in {path} must be a JSON object")
+        raise ConfigError(f"mapping file {path} must contain a 'roles' object")
 
     parsed: dict[str, list[str]] = {}
     for role, permissions in roles.items():
@@ -244,8 +254,8 @@ def _parse_roles(
                 f"unknown GitHub role {role!r} in {path}; "
                 f"expected one of: {', '.join(GITHUB_ROLES)}"
             )
-        parsed[normalised_role] = _parse_role_permissions(
-            role, permissions, path, valid_permissions
+        parsed[normalised_role] = _parse_permission_list(
+            f"role {role!r}", permissions, path, valid_permissions
         )
 
     missing = [role for role in GITHUB_ROLES if role not in parsed]
@@ -256,14 +266,79 @@ def _parse_roles(
     return parsed
 
 
-def _parse_role_permissions(
-    role: str, permissions: Any, path: str, valid_permissions: dict[str, str]
+def _parse_admin_users(
+    raw: dict, path: str, valid_permissions: dict[str, str]
+) -> tuple[list[str], list[str]]:
+    """Read the optional `admin_users` object.
+
+    Returns the configured logins and the permissions each of them receives.
+    An absent or empty object simply disables the feature.
+    """
+    default_permissions = ["admin", "codeviewer", "user"]
+
+    section = raw.get("admin_users")
+    if section is None:
+        return [], [p for p in default_permissions if p in valid_permissions]
+    if not isinstance(section, dict):
+        raise ConfigError(
+            f"'admin_users' in {path} must be a JSON object with 'logins' and "
+            "'permissions' keys"
+        )
+
+    raw_logins = section.get("logins", [])
+    if not isinstance(raw_logins, list) or not all(
+        isinstance(item, str) for item in raw_logins
+    ):
+        raise ConfigError(
+            f"'admin_users.logins' in {path} must be a list of SonarQube Cloud "
+            "logins"
+        )
+
+    logins: list[str] = []
+    seen: set[str] = set()
+    for login in raw_logins:
+        normalised = login.strip()
+        if not normalised:
+            raise ConfigError(
+                f"'admin_users.logins' in {path} contains an empty login"
+            )
+        if normalised.lower() not in seen:
+            seen.add(normalised.lower())
+            logins.append(normalised)
+
+    if "permissions" in section:
+        permissions = _parse_permission_list(
+            "'admin_users.permissions'",
+            section["permissions"],
+            path,
+            valid_permissions,
+        )
+    else:
+        permissions = [p for p in default_permissions if p in valid_permissions]
+
+    if logins and not permissions:
+        raise ConfigError(
+            f"'admin_users.logins' in {path} lists {len(logins)} user(s) but "
+            "'admin_users.permissions' is empty, so they would be granted "
+            "nothing; add permissions or empty the login list"
+        )
+
+    return logins, permissions
+
+
+def _parse_permission_list(
+    context: str, permissions: Any, path: str, valid_permissions: dict[str, str]
 ) -> list[str]:
+    """Validate one list of permissions against the catalogue.
+
+    `context` names the offending place in the file for error messages, e.g.
+    "role 'write'" or "'admin_users.permissions'".
+    """
     if not isinstance(permissions, list) or not all(
         isinstance(item, str) for item in permissions
     ):
         raise ConfigError(
-            f"permissions for role {role!r} in {path} must be a list of strings"
+            f"permissions for {context} in {path} must be a list of strings"
         )
 
     cleaned: list[str] = []
@@ -271,8 +346,8 @@ def _parse_role_permissions(
         normalised = permission.strip()
         if normalised not in valid_permissions:
             raise ConfigError(
-                f"unknown SonarQube Cloud permission {permission!r} for role "
-                f"{role!r} in {path}; expected one of the '_sqc_permissions' "
+                f"unknown SonarQube Cloud permission {permission!r} for "
+                f"{context} in {path}; expected one of the '_sqc_permissions' "
                 f"keys: {', '.join(valid_permissions)}"
             )
         if normalised not in cleaned:
@@ -676,11 +751,36 @@ class SqcClient:
 # --------------------------------------------------------------------------- #
 
 
+ADMIN_LIST_SOURCE = "admin list"
+
+
 @dataclass
 class Resolved:
-    actor: GithubActor
+    """One SQC user or group and the permissions it will be granted."""
+
+    label: str  # how the principal is shown in the report
+    source: str  # the GitHub role it came from, or "admin list"
     sqc_name: str
     permissions: list[str]
+
+    @staticmethod
+    def from_actor(
+        actor: GithubActor, sqc_name: str, permissions: list[str]
+    ) -> "Resolved":
+        return Resolved(
+            label=actor.label(),
+            source=actor.role,
+            sqc_name=sqc_name,
+            permissions=list(permissions),
+        )
+
+    def merge(self, source: str, permissions: Iterable[str]) -> None:
+        """Add another grant for the same principal, keeping the union."""
+        if source not in self.source.split(" + "):
+            self.source = f"{self.source} + {source}"
+        for permission in permissions:
+            if permission not in self.permissions:
+                self.permissions.append(permission)
 
 
 @dataclass
@@ -689,6 +789,7 @@ class Plan:
     groups: list[Resolved] = field(default_factory=list)
     missing_users: list[GithubActor] = field(default_factory=list)
     missing_groups: list[GithubActor] = field(default_factory=list)
+    missing_admin_users: list[str] = field(default_factory=list)
     unmapped: list[Resolved] = field(default_factory=list)
 
     def has_work(self) -> bool:
@@ -703,18 +804,79 @@ def build_plan(
 ) -> Plan:
     plan = Plan()
 
+    # Keyed by SQC login so that a collaborator who is also on the admin list
+    # ends up with the union of both grants rather than two competing entries.
+    by_login: dict[str, Resolved] = {}
+    _resolve_collaborators(sqc, collaborators, mappings, plan, by_login)
+    _resolve_admin_users(sqc, mappings, plan, by_login)
+
+    for resolved in by_login.values():
+        _file_resolved(plan, resolved, plan.users)
+
+    _resolve_teams(sqc, teams, mappings, plan)
+    return plan
+
+
+def _file_resolved(plan: Plan, resolved: Resolved, bucket: list[Resolved]) -> None:
+    """Put a resolved principal in its bucket, or in `unmapped` if it gets nothing."""
+    if resolved.permissions:
+        bucket.append(resolved)
+    else:
+        plan.unmapped.append(resolved)
+
+
+def _resolve_collaborators(
+    sqc: SqcClient,
+    collaborators: Iterable[GithubActor],
+    mappings: Mappings,
+    plan: Plan,
+    by_login: dict[str, Resolved],
+) -> None:
     for actor in collaborators:
         permissions = mappings.roles.get(actor.role, [])
         sqc_login = sqc.find_user(actor.identifier)
         if sqc_login is None:
             plan.missing_users.append(actor)
             continue
-        resolved = Resolved(actor=actor, sqc_name=sqc_login, permissions=permissions)
-        if permissions:
-            plan.users.append(resolved)
+        existing = by_login.get(sqc_login.lower())
+        if existing is None:
+            by_login[sqc_login.lower()] = Resolved.from_actor(
+                actor, sqc_login, permissions
+            )
         else:
-            plan.unmapped.append(resolved)
+            existing.merge(actor.role, permissions)
 
+
+def _resolve_admin_users(
+    sqc: SqcClient,
+    mappings: Mappings,
+    plan: Plan,
+    by_login: dict[str, Resolved],
+) -> None:
+    """Add the configured admin users, merging with their GitHub role if any."""
+    for login in mappings.admin_users:
+        sqc_login = sqc.find_user(login)
+        if sqc_login is None:
+            plan.missing_admin_users.append(login)
+            continue
+        existing = by_login.get(sqc_login.lower())
+        if existing is None:
+            by_login[sqc_login.lower()] = Resolved(
+                label=login,
+                source=ADMIN_LIST_SOURCE,
+                sqc_name=sqc_login,
+                permissions=list(mappings.admin_user_permissions),
+            )
+        else:
+            existing.merge(ADMIN_LIST_SOURCE, mappings.admin_user_permissions)
+
+
+def _resolve_teams(
+    sqc: SqcClient,
+    teams: Iterable[GithubActor],
+    mappings: Mappings,
+    plan: Plan,
+) -> None:
     for actor in teams:
         permissions = mappings.roles.get(actor.role, [])
         group_name = sqc.find_group(actor.identifier)
@@ -723,47 +885,43 @@ def build_plan(
         if group_name is None:
             plan.missing_groups.append(actor)
             continue
-        resolved = Resolved(actor=actor, sqc_name=group_name, permissions=permissions)
-        if permissions:
-            plan.groups.append(resolved)
-        else:
-            plan.unmapped.append(resolved)
+        _file_resolved(
+            plan, Resolved.from_actor(actor, group_name, permissions), plan.groups
+        )
 
-    return plan
+
+def _print_resolved(title: str, kind: str, items: list[Resolved]) -> None:
+    heading(title)
+    if not items:
+        info("(none)")
+        return
+    for item in items:
+        ok(
+            f"{item.label} [{item.source}] -> SQC {kind} "
+            f"'{item.sqc_name}': {', '.join(item.permissions)}"
+        )
 
 
 def print_plan(plan: Plan) -> None:
-    heading("Users to add to the permission template")
-    if plan.users:
-        for item in plan.users:
-            ok(
-                f"{item.actor.label()} [{item.actor.role}] -> SQC user "
-                f"'{item.sqc_name}': {', '.join(item.permissions)}"
-            )
-    else:
-        info("(none)")
+    _print_resolved("Users to add to the permission template", "user", plan.users)
+    _print_resolved("Groups to add to the permission template", "group", plan.groups)
 
-    heading("Groups to add to the permission template")
-    if plan.groups:
-        for item in plan.groups:
-            ok(
-                f"{item.actor.label()} [{item.actor.role}] -> SQC group "
-                f"'{item.sqc_name}': {', '.join(item.permissions)}"
-            )
-    else:
-        info("(none)")
-
-    if plan.missing_users or plan.missing_groups:
-        heading("Skipped: present on GitHub but not found on SonarQube Cloud")
+    if plan.missing_users or plan.missing_groups or plan.missing_admin_users:
+        heading("Skipped: not found on SonarQube Cloud")
         for actor in plan.missing_users:
             skip(f"user {actor.label()} [{actor.role}] - no matching SQC member")
         for actor in plan.missing_groups:
             skip(f"team {actor.label()} [{actor.role}] - no matching SQC group")
+        for login in plan.missing_admin_users:
+            skip(
+                f"admin user '{login}' [{ADMIN_LIST_SOURCE}] - no matching SQC "
+                "member; check the login in the mapping file"
+            )
 
     if plan.unmapped:
-        heading("Skipped: role maps to no SonarQube Cloud permission")
+        heading("Skipped: maps to no SonarQube Cloud permission")
         for item in plan.unmapped:
-            skip(f"{item.actor.label()} [{item.actor.role}] -> '{item.sqc_name}'")
+            skip(f"{item.label} [{item.source}] -> '{item.sqc_name}'")
 
 
 # --------------------------------------------------------------------------- #
@@ -847,6 +1005,14 @@ def _print_configuration(
         rendered = ", ".join(permissions) if permissions else "(no permissions)"
         info(f"{role.capitalize():<9} -> {rendered}")
 
+    heading("Admin users (optional, from the mapping file)")
+    if mappings.admin_users:
+        info(f"Granted: {', '.join(mappings.admin_user_permissions)}")
+        for login in mappings.admin_users:
+            info(f"  {login}")
+    else:
+        info("(none configured)")
+
 
 def _print_actors(label: str, actors: list[GithubActor]) -> None:
     info(f"{label}: {len(actors)}")
@@ -870,12 +1036,21 @@ def run(args: argparse.Namespace) -> int:
     _print_actors("Direct collaborators", collaborators)
     _print_actors("Teams with access", teams)
 
-    if not collaborators and not teams:
+    # Configured admin users are work in their own right, so an empty GitHub
+    # side is only fatal when the admin list is empty too.
+    if not collaborators and not teams and not mappings.admin_users:
         fail(
             f"{config.gh_org}/{config.gh_repository} has no direct collaborators and "
-            "no teams; nothing to copy."
+            "no teams, and no admin users are configured in the mapping file; "
+            "nothing to copy."
         )
         return 1
+    if not collaborators and not teams:
+        warn(
+            f"{config.gh_org}/{config.gh_repository} has no direct collaborators "
+            "and no teams; only the configured admin users will be granted "
+            "permissions, which removes every other permission on the project."
+        )
 
     heading("Checking the destination project on SonarQube Cloud")
     project = sqc.find_project()
@@ -897,17 +1072,17 @@ def run(args: argparse.Namespace) -> int:
             "cannot be checked or restored after the template is applied."
         )
 
-    heading("Resolving GitHub users and teams on SonarQube Cloud")
-    info("Looking up each collaborator and team...")
+    heading("Resolving users, teams and admin users on SonarQube Cloud")
+    info("Looking up each collaborator, team and configured admin user...")
     plan = build_plan(sqc, collaborators, teams, mappings)
     print_plan(plan)
 
     if not plan.has_work():
         print()
         fail(
-            "none of the GitHub users or teams could be matched to a SonarQube Cloud "
-            "member or group with at least one mapped permission; no permission "
-            "template will be created."
+            "none of the GitHub users or teams, and none of the configured admin "
+            "users, could be matched to a SonarQube Cloud member or group with at "
+            "least one mapped permission; no permission template will be created."
         )
         return 1
 
@@ -920,9 +1095,15 @@ def run(args: argparse.Namespace) -> int:
         f"{len(plan.users)} user(s) and {len(plan.groups)} group(s), "
         f"{permission_count} permission grant(s)"
     )
+    skipped = (
+        len(plan.missing_users)
+        + len(plan.missing_groups)
+        + len(plan.missing_admin_users)
+    )
     info(
-        f"{len(plan.missing_users)} user(s) and {len(plan.missing_groups)} group(s) "
-        "will be skipped"
+        f"{skipped} principal(s) will be skipped "
+        f"({len(plan.missing_users)} user, {len(plan.missing_groups)} group, "
+        f"{len(plan.missing_admin_users)} admin user)"
     )
 
     if args.dry_run:
