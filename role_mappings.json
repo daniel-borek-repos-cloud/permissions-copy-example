@@ -1,0 +1,86 @@
+{
+  "_comment": [
+    "GitHub repository role -> SonarQube Cloud project permission mapping.",
+    "",
+    "JSON has no comment syntax, so keys starting with an underscore hold the",
+    "documentation. gh_to_sqc_permissions.py ignores them all except for",
+    "'_sqc_permissions', which it reads: those keys are the only permissions",
+    "accepted under 'roles', and their values are the corresponding names in the",
+    "SonarQube Cloud UI. This file is therefore the single source of truth for",
+    "the permission list - the script hard-codes nothing.",
+    "",
+    "The values under 'roles' are the raw permission keys that the script sends",
+    "as the 'permission' parameter of /api/permissions/add_user_to_template and",
+    "/api/permissions/add_group_to_template. They mean:",
+    "",
+    "  user                 -> Browse Project",
+    "                          See the project and its measures, issues and pages.",
+    "  codeviewer           -> See Source Code",
+    "                          View the source code of the project.",
+    "  issueadmin           -> Administer Issues",
+    "                          Resolve, reopen, assign and change the severity of issues.",
+    "  securityhotspotadmin -> Administer Security Hotspots",
+    "                          Change the status of a Security Hotspot.",
+    "  scan                 -> Execute Analysis",
+    "                          Run an analysis and push results to the project.",
+    "  admin                -> Administer Project",
+    "                          Change the project configuration, permissions and settings.",
+    "",
+    "The five keys under 'roles' are the GitHub repository roles. All five must",
+    "be present. An empty list is allowed and means the role grants nothing on",
+    "SonarQube Cloud, in which case those users and teams are reported as",
+    "skipped. Order inside a list does not matter and duplicates are ignored.",
+    "",
+    "GitHub's legacy API permission names are normalised before lookup:",
+    "  pull -> read, push -> write, triage/maintain/admin are unchanged."
+  ],
+
+  "_sqc_permissions_comment": [
+    "Read by the script: the permitted values under 'roles', mapped to their",
+    "names in the SonarQube Cloud UI. Only remove an entry here if SonarQube",
+    "Cloud stops accepting it; removing one that is still used under 'roles'",
+    "makes the script exit with a configuration error."
+  ],
+
+  "_sqc_permissions": {
+    "user": "Browse Project",
+    "codeviewer": "See Source Code",
+    "issueadmin": "Administer Issues",
+    "securityhotspotadmin": "Administer Security Hotspots",
+    "scan": "Execute Analysis",
+    "admin": "Administer Project"
+  },
+
+  "roles": {
+    "read": [
+      "user",
+      "codeviewer"
+    ],
+    "triage": [
+      "user",
+      "codeviewer"
+    ],
+    "write": [
+      "user",
+      "codeviewer",
+      "issueadmin",
+      "securityhotspotadmin",
+      "scan"
+    ],
+    "maintain": [
+      "user",
+      "codeviewer",
+      "issueadmin",
+      "securityhotspotadmin",
+      "scan"
+    ],
+    "admin": [
+      "user",
+      "codeviewer",
+      "issueadmin",
+      "securityhotspotadmin",
+      "scan",
+      "admin"
+    ]
+  }
+}
