@@ -30,7 +30,9 @@ Only the Python standard library is used — no `pip install` needed.
    one of `read`, `triage`, `write`, `maintain`, `admin`.
 3. **Check the destination project on SQC** with `GET /api/projects/search`. If the
    project key does not exist in the organization, the script prints an error and
-   exits with status `1` without touching anything.
+   exits with status `1` without touching anything. The same response carries the
+   project's **current visibility**, which is recorded so it can be restored in
+   step 9.
 4. **Resolve every GitHub user and team on SQC.**
    * Each GitHub team slug (and, as a fallback, its display name) is looked up as
      an SQC group via `GET /api/user_groups/search`.
@@ -53,15 +55,37 @@ Only the Python standard library is used — no `pip install` needed.
    `POST /api/permissions/add_user_to_template`.
 8. **Apply the template to the project** with
    `POST /api/permissions/apply_template`.
-9. **Delete the temporary template** with
-   `POST /api/permissions/delete_template`. This runs in a `finally` block, so the
-   template is cleaned up even if filling it in or applying it fails. Pass
-   `--keep-template` to leave it in place for debugging.
+9. **Re-read the visibility and restore it if it changed.** Applying a permission
+   template can reset a project's visibility to the organization's default for new
+   projects, which would turn a **private project public**. The script compares the
+   visibility against the value recorded in step 3 and, only if it differs, calls
+   `POST /api/projects/update_visibility` to put it back, then reads it once more to
+   confirm. A private project stays private and a public project stays public.
+10. **Delete the temporary template** with
+    `POST /api/permissions/delete_template`. Both this and the visibility check run
+    in a `finally` block, so they happen even if filling in or applying the template
+    fails. Pass `--keep-template` to leave the template in place for debugging.
 
 > **Applying a permission template replaces the project's current permissions.**
 > This is how SQC's `apply_template` behaves: any existing user or group permission
 > on the project that is not in the template is removed. The script warns about
 > this and asks for confirmation before it proceeds (skip with `--yes`).
+
+### Visibility is preserved, not assumed
+
+The visibility guard is deliberately a *compare-then-correct*, not a blind write:
+
+* Recorded **before** the template is applied, from the `projects/search` response
+  the script already makes — no extra API call.
+* Re-read **after** applying. If it is unchanged, nothing is written.
+* If it changed, the original value is restored and verified. If the restore fails,
+  the script says so explicitly, tells you which visibility to set by hand, and
+  exits `1` — it never reports success on a project left public by mistake.
+* If SQC does not report a visibility at all, the script warns that it cannot be
+  restored rather than guessing a value.
+
+`--dry-run` performs no visibility write, and neither does a run where applying the
+template failed.
 
 ## SonarQube Cloud permissions
 
@@ -84,8 +108,16 @@ These are the values the script sends as the `permission` parameter:
 | `codeviewer` | See Source Code | View the project's source code |
 | `issueadmin` | Administer Issues | Resolve, reopen, assign, change issue severity |
 | `securityhotspotadmin` | Administer Security Hotspots | Change the status of a Security Hotspot |
+| `architectureadmin` | Administer Architecture | Edit the project's intended architecture. Without it the architecture editor is read-only; viewing the architecture map needs no permission |
 | `scan` | Execute Analysis | Run an analysis and push results to the project |
 | `admin` | Administer Project | Change project configuration, permissions and settings |
+
+These are all seven project permissions SonarQube Cloud currently accepts, per the
+`permission` parameter in <https://sonarcloud.io/api/webservices/list>.
+
+`architectureadmin` is in the catalogue but **not granted by any role** in the
+default mapping, so it is available without changing current behaviour — add it to
+a role's list to start granting it.
 
 ## Role mappings
 
@@ -239,19 +271,20 @@ Requests are sent with `Authorization: Bearer $GH_TOKEN`,
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/projects/search` | Check the destination project exists |
+| `GET` | `/api/projects/search` | Check the destination project exists, and read its visibility (before and after applying) |
 | `GET` | `/api/user_groups/search` | Find the SQC group matching a GitHub team |
 | `GET` | `/api/organizations/search_members` | Find the SQC member matching a GitHub user |
 | `POST` | `/api/permissions/create_template` | Create the temporary template |
 | `POST` | `/api/permissions/add_group_to_template` | Grant one permission to one group |
 | `POST` | `/api/permissions/add_user_to_template` | Grant one permission to one user |
 | `POST` | `/api/permissions/apply_template` | Apply the template to `PROJECT_KEY` |
+| `POST` | `/api/projects/update_visibility` | Restore the original visibility — **only if applying the template changed it** |
 | `POST` | `/api/permissions/delete_template` | Delete the temporary template |
 
-Requests are sent with `Authorization: Bearer $SQC_TOKEN`, `POST` bodies are
-`application/x-www-form-urlencoded`, and every call carries
-`organization=$SQC_ORG`. `429` and `5xx` responses are retried three times with
-exponential backoff.
+Requests are sent with `Authorization: Bearer $SQC_TOKEN` and `POST` bodies are
+`application/x-www-form-urlencoded`. Every call carries `organization=$SQC_ORG`
+except `update_visibility`, whose only parameters are `project` and `visibility`.
+`429` and `5xx` responses are retried three times with exponential backoff.
 
 ## Notes and limitations
 

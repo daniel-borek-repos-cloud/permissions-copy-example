@@ -537,9 +537,14 @@ class SqcClient:
         )
         self._org = config.sqc_org
 
+    @property
+    def project_key(self) -> str:
+        return self._config.project_key
+
     # -- lookups ---------------------------------------------------------- #
 
-    def project_exists(self) -> dict | None:
+    def find_project(self) -> dict | None:
+        """Return the project component, including its `visibility`, or None."""
         payload = self._http.get(
             f"{SQC_API}/projects/search",
             params={"organization": self._org, "projects": self._config.project_key},
@@ -549,6 +554,12 @@ class SqcClient:
             if component.get("key") == self._config.project_key:
                 return component
         return None
+
+    def project_visibility(self) -> str | None:
+        """Read the project's current visibility ('private' or 'public')."""
+        project = self.find_project()
+        visibility = (project or {}).get("visibility")
+        return visibility if isinstance(visibility, str) else None
 
     def find_group(self, name: str) -> str | None:
         """Return the exact SQC group name matching `name`, if any."""
@@ -644,6 +655,19 @@ class SqcClient:
         self._http.post(
             f"{SQC_API}/permissions/delete_template",
             form={"organization": self._org, "templateName": template_name},
+        )
+
+    # -- visibility -------------------------------------------------------- #
+
+    def update_visibility(self, visibility: str) -> None:
+        """Set the project's visibility.
+
+        This endpoint takes only `project` and `visibility` — it has no
+        `organization` parameter.
+        """
+        self._http.post(
+            f"{SQC_API}/projects/update_visibility",
+            form={"project": self._config.project_key, "visibility": visibility},
         )
 
 
@@ -804,10 +828,9 @@ def confirm(prompt: str) -> bool:
     return answer in ("y", "yes")
 
 
-def run(args: argparse.Namespace) -> int:
-    config = Config.from_env()
-    mappings = load_mappings(args.mappings)
-
+def _print_configuration(
+    config: Config, args: argparse.Namespace, mappings: Mappings
+) -> None:
     heading("Configuration")
     info(f"GitHub repository : {config.gh_org}/{config.gh_repository}")
     info(f"SQC organization  : {config.sqc_org}")
@@ -824,6 +847,19 @@ def run(args: argparse.Namespace) -> int:
         rendered = ", ".join(permissions) if permissions else "(no permissions)"
         info(f"{role.capitalize():<9} -> {rendered}")
 
+
+def _print_actors(label: str, actors: list[GithubActor]) -> None:
+    info(f"{label}: {len(actors)}")
+    for actor in actors:
+        info(f"  {actor.label()} [{actor.role}]")
+
+
+def run(args: argparse.Namespace) -> int:
+    config = Config.from_env()
+    mappings = load_mappings(args.mappings)
+
+    _print_configuration(config, args, mappings)
+
     github = GithubClient(config, verbose=args.verbose)
     sqc = SqcClient(config, verbose=args.verbose)
 
@@ -831,12 +867,8 @@ def run(args: argparse.Namespace) -> int:
     github.check_repository()
     collaborators = github.direct_collaborators()
     teams = github.teams()
-    info(f"Direct collaborators: {len(collaborators)}")
-    for actor in collaborators:
-        info(f"  {actor.label()} [{actor.role}]")
-    info(f"Teams with access: {len(teams)}")
-    for actor in teams:
-        info(f"  {actor.label()} [{actor.role}]")
+    _print_actors("Direct collaborators", collaborators)
+    _print_actors("Teams with access", teams)
 
     if not collaborators and not teams:
         fail(
@@ -846,7 +878,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     heading("Checking the destination project on SonarQube Cloud")
-    project = sqc.project_exists()
+    project = sqc.find_project()
     if project is None:
         fail(
             f"project '{config.project_key}' was not found in SonarQube Cloud "
@@ -854,6 +886,16 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
     ok(f"found '{project.get('name') or config.project_key}' ({config.project_key})")
+
+    original_visibility = project.get("visibility")
+    if isinstance(original_visibility, str):
+        ok(f"current visibility: {original_visibility} (will be preserved)")
+    else:
+        original_visibility = None
+        warn(
+            "SonarQube Cloud did not report the project's visibility, so it "
+            "cannot be checked or restored after the template is applied."
+        )
 
     heading("Resolving GitHub users and teams on SonarQube Cloud")
     info("Looking up each collaborator and team...")
@@ -893,12 +935,43 @@ def run(args: argparse.Namespace) -> int:
         f"applying a permission template replaces the existing permissions of "
         f"'{config.project_key}'."
     )
+    if original_visibility:
+        info(
+            f"visibility will be checked afterwards and kept at "
+            f"'{original_visibility}'."
+        )
     if not args.yes and not confirm(
         f"Apply these permissions to '{config.project_key}'?"
     ):
         info("aborted; nothing was changed.")
         return 130
 
+    exit_code = apply_permissions(
+        sqc, config, args, plan, original_visibility=original_visibility
+    )
+
+    if exit_code == 0:
+        print()
+        ok(
+            f"GitHub permissions of {config.gh_org}/{config.gh_repository} were "
+            f"applied to '{config.project_key}'."
+        )
+    return exit_code
+
+
+def apply_permissions(
+    sqc: SqcClient,
+    config: Config,
+    args: argparse.Namespace,
+    plan: Plan,
+    *,
+    original_visibility: str | None,
+) -> int:
+    """Create the temporary template, apply it, then clean up.
+
+    The template is deleted and the project's visibility is restored even if
+    filling in or applying the template fails.
+    """
     template_name = temporary_template_name(config.project_key, args.template_name)
 
     heading("Creating the temporary permission template")
@@ -912,44 +985,98 @@ def run(args: argparse.Namespace) -> int:
     ok(f"created template '{created}'")
 
     exit_code = 0
+    applied = False
     try:
         heading("Filling in the template")
-        for item in plan.groups:
-            for permission in item.permissions:
-                sqc.add_group_to_template(created, item.sqc_name, permission)
-                ok(f"group '{item.sqc_name}' + {permission}")
-        for item in plan.users:
-            for permission in item.permissions:
-                sqc.add_user_to_template(created, item.sqc_name, permission)
-                ok(f"user '{item.sqc_name}' + {permission}")
+        _fill_template(sqc, created, plan)
 
         heading("Applying the template to the project")
+        applied = True
         sqc.apply_template(created)
         ok(f"applied '{created}' to '{config.project_key}'")
     except ApiError as exc:
         fail(str(exc))
         exit_code = 1
     finally:
-        if args.keep_template:
-            heading("Temporary template kept")
-            info(f"'{created}' was left in place (--keep-template)")
-        else:
-            heading("Deleting the temporary permission template")
-            try:
-                sqc.delete_template(created)
-                ok(f"deleted template '{created}'")
-            except ApiError as exc:
-                fail(f"could not delete the temporary template '{created}': {exc}")
-                warn("delete it manually in SonarQube Cloud to avoid clutter.")
-                exit_code = exit_code or 1
+        if applied:
+            exit_code = _restore_visibility(sqc, original_visibility) or exit_code
+        exit_code = _remove_template(sqc, created, args.keep_template) or exit_code
 
-    if exit_code == 0:
-        print()
-        ok(
-            f"GitHub permissions of {config.gh_org}/{config.gh_repository} were "
-            f"applied to '{config.project_key}'."
-        )
     return exit_code
+
+
+def _fill_template(sqc: SqcClient, template_name: str, plan: Plan) -> None:
+    for item in plan.groups:
+        for permission in item.permissions:
+            sqc.add_group_to_template(template_name, item.sqc_name, permission)
+            ok(f"group '{item.sqc_name}' + {permission}")
+    for item in plan.users:
+        for permission in item.permissions:
+            sqc.add_user_to_template(template_name, item.sqc_name, permission)
+            ok(f"user '{item.sqc_name}' + {permission}")
+
+
+def _restore_visibility(sqc: SqcClient, original: str | None) -> int:
+    """Put the project's visibility back if applying the template changed it.
+
+    Applying a permission template can reset a project's visibility to the
+    organization's default for new projects, which would make a private project
+    public. The visibility read before the template was applied is authoritative.
+    """
+    heading("Checking the project's visibility")
+    if original is None:
+        warn("the original visibility is unknown, so it cannot be restored.")
+        return 0
+
+    try:
+        current = sqc.project_visibility()
+    except ApiError as exc:
+        fail(f"could not read the project's visibility back: {exc}")
+        warn(f"check in SonarQube Cloud that the project is still {original}.")
+        return 1
+
+    if current == original:
+        ok(f"still {original}; unchanged")
+        return 0
+
+    warn(
+        f"applying the template changed the visibility from {original} to "
+        f"{current}; restoring {original}."
+    )
+    try:
+        sqc.update_visibility(original)
+    except ApiError as exc:
+        fail(f"could not restore the project's visibility to {original}: {exc}")
+        warn(f"set '{sqc.project_key}' back to {original} in SonarQube Cloud now.")
+        return 1
+
+    verified = None
+    try:
+        verified = sqc.project_visibility()
+    except ApiError:
+        pass  # the restore call itself succeeded; the read-back is a courtesy
+    if verified is not None and verified != original:
+        fail(f"visibility is {verified} after restoring it to {original}.")
+        return 1
+    ok(f"restored to {original}")
+    return 0
+
+
+def _remove_template(sqc: SqcClient, template_name: str, keep: bool) -> int:
+    if keep:
+        heading("Temporary template kept")
+        info(f"'{template_name}' was left in place (--keep-template)")
+        return 0
+
+    heading("Deleting the temporary permission template")
+    try:
+        sqc.delete_template(template_name)
+    except ApiError as exc:
+        fail(f"could not delete the temporary template '{template_name}': {exc}")
+        warn("delete it manually in SonarQube Cloud to avoid clutter.")
+        return 1
+    ok(f"deleted template '{template_name}'")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
