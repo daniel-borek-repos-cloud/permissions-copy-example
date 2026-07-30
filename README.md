@@ -11,7 +11,7 @@ Only the Python standard library is used — no `pip install` needed.
 | File | Purpose |
 | --- | --- |
 | [gh_to_sqc_permissions.py](gh_to_sqc_permissions.py) | The script |
-| [role_mappings.json](role_mappings.json) | GitHub role → SQC permission mapping |
+| [role_mappings.json](role_mappings.json) | GitHub role → SQC permission mapping, the permission catalogue, and the optional admin users list |
 | [README.md](README.md) | This document |
 
 ## How it works
@@ -33,17 +33,18 @@ Only the Python standard library is used — no `pip install` needed.
    exits with status `1` without touching anything. The same response carries the
    project's **current visibility**, which is recorded so it can be restored in
    step 9.
-4. **Resolve every GitHub user and team on SQC.**
+4. **Resolve every GitHub user and team on SQC**, plus any configured
+   [admin users](#admin-users-optional).
    * Each GitHub team slug (and, as a fallback, its display name) is looked up as
      an SQC group via `GET /api/user_groups/search`.
-   * Each GitHub login is looked up as an organization member via
-     `GET /api/organizations/search_members`. A match requires the SQC login to
-     equal the GitHub login, or to equal the GitHub login plus a provider suffix
-     (`octocat@github`), both compared case-insensitively.
+   * Each GitHub login, and each login in the optional admin users list, is looked
+     up as an organization member via `GET /api/organizations/search_members`. A
+     match requires the SQC login to equal the given login, or to equal it plus a
+     provider suffix (`octocat@github`), both compared case-insensitively.
    The script then prints three lists: the users and groups that **will** be added
-   with the exact permissions each will receive, the users and groups that exist
-   on GitHub but **not** on SQC and will be skipped, and anyone whose role maps to
-   an empty permission list.
+   with the exact permissions each will receive, the principals that could **not**
+   be found on SQC and will be skipped, and anyone who maps to an empty permission
+   list.
 5. **Exit early if there is nothing to do.** If no user and no group can be matched
    with at least one mapped permission, the script prints a message and exits with
    status `1` — no template is created.
@@ -139,6 +140,53 @@ teams are then listed as skipped.
 Keys beginning with `_` hold the file's own documentation, which is how it stays
 valid JSON while explaining itself. The one exception is `_sqc_permissions`,
 which the script reads — see [above](#sonarqube-cloud-permissions).
+
+## Admin users (optional)
+
+Extra users who should administer the project **regardless of what GitHub says** —
+typically the people who own the SonarQube Cloud side and are not necessarily
+repository collaborators. Configure them in the `admin_users` object of
+[role_mappings.json](role_mappings.json):
+
+```json
+"admin_users": {
+  "permissions": ["admin", "codeviewer", "user"],
+  "logins": ["jsmith", "adevops@github"]
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `logins` | SonarQube Cloud logins. For GitHub-authenticated users this is usually the GitHub login, sometimes with a provider suffix (`jsmith@github`). Defaults to empty |
+| `permissions` | What each of these users receives. Must be keys of `_sqc_permissions`. Defaults to `["admin", "codeviewer", "user"]` |
+
+The default grants **Administer Project** (`admin`) and **See Source Code**
+(`codeviewer`), plus **Browse Project** (`user`) — without `user` a person cannot
+open the project in the SQC UI at all, which would make the other two useless.
+
+### Behaviour
+
+* **Optional.** Leave `logins` empty, or delete the whole `admin_users` object, and
+  the feature is inert — nothing about a run changes.
+* **Validated like any other principal.** Each login is looked up among the
+  organization's members. One that does not exist on SQC is reported as skipped
+  (`admin user 'ghost' — no matching SQC member`) rather than failing the run.
+* **Combined, never substituted.** A login that is *also* a GitHub collaborator
+  keeps both sets of permissions. The union is granted once, with no duplicate API
+  calls, and the report shows the merge:
+
+  ```
+  + bob [write + admin list] -> SQC user 'bob': user, codeviewer, issueadmin, securityhotspotadmin, scan, admin
+  + zoe [admin list]         -> SQC user 'zoe': admin, codeviewer, user
+  ```
+* **Duplicates collapse.** Repeated or case-variant logins are de-duplicated.
+* **Enough on their own.** If the repository has no direct collaborators and no
+  teams, a configured admin list still counts as work — the script warns that only
+  the admin users will hold permissions (which removes every other permission on
+  the project) and continues. With an empty admin list that same situation exits
+  `1`.
+* **Misconfiguration fails fast.** Listing logins while `permissions` is empty is a
+  configuration error, since those users would silently be granted nothing.
 
 ## Environment variables
 
@@ -249,7 +297,7 @@ python3 gh_to_sqc_permissions.py
 | Code | Meaning |
 | --- | --- |
 | `0` | Success, or a completed dry run |
-| `1` | Project not found, no matching users/groups, or an API call failed |
+| `1` | Project not found, no matching users/groups/admin users, or an API call failed |
 | `2` | Bad configuration — missing environment variable or invalid mapping file |
 | `130` | Cancelled at the confirmation prompt, or interrupted |
 
