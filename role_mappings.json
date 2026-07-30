@@ -21,6 +21,11 @@
     "                          Resolve, reopen, assign and change the severity of issues.",
     "  securityhotspotadmin -> Administer Security Hotspots",
     "                          Change the status of a Security Hotspot.",
+    "  architectureadmin    -> Administer Architecture",
+    "                          Edit the project's intended architecture. Without it",
+    "                          the architecture editor is read-only; viewing the",
+    "                          architecture map needs no permission. Not granted by",
+    "                          any role below by default - add it where you want it.",
     "  scan                 -> Execute Analysis",
     "                          Run an analysis and push results to the project.",
     "  admin                -> Administer Project",
@@ -39,7 +44,13 @@
     "Read by the script: the permitted values under 'roles', mapped to their",
     "names in the SonarQube Cloud UI. Only remove an entry here if SonarQube",
     "Cloud stops accepting it; removing one that is still used under 'roles'",
-    "makes the script exit with a configuration error."
+    "makes the script exit with a configuration error.",
+    "",
+    "These are the seven project permissions SonarQube Cloud accepts, as listed",
+    "by https://sonarcloud.io/api/webservices/list for the 'permission'",
+    "parameter. An entry here is merely available for use - it grants nothing",
+    "until a role under 'roles' references it. 'architectureadmin' is present",
+    "but intentionally unmapped."
   ],
 
   "_sqc_permissions": {
@@ -47,6 +58,7 @@
     "codeviewer": "See Source Code",
     "issueadmin": "Administer Issues",
     "securityhotspotadmin": "Administer Security Hotspots",
+    "architectureadmin": "Administer Architecture",
     "scan": "Execute Analysis",
     "admin": "Administer Project"
   },
