@@ -189,8 +189,14 @@ def load_mappings(path: str) -> Mappings:
     Other keys starting with an underscore are comments and are ignored, which
     is how the shipped file documents itself while staying valid JSON.
     """
+    resolved = os.path.realpath(path)
+    base_dir = os.path.realpath(os.getcwd())
+    if resolved != base_dir and not resolved.startswith(base_dir + os.sep):
+        raise ConfigError(
+            f"mapping file {path} is outside the current working directory"
+        )
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(resolved, encoding="utf-8") as handle:
             raw = json.load(handle)
     except FileNotFoundError:
         raise ConfigError(f"mapping file not found: {path}") from None
@@ -366,14 +372,13 @@ class HttpClient:
         self._timeout = timeout
         self._verbose = verbose
 
-    def request(
+    def _build_request(
         self,
         method: str,
         url: str,
-        *,
-        params: dict[str, Any] | None = None,
-        form: dict[str, Any] | None = None,
-    ) -> tuple[int, Any, dict[str, str]]:
+        params: dict[str, Any] | None,
+        form: dict[str, Any] | None,
+    ) -> tuple[str, urllib.request.Request]:
         if params:
             query = urllib.parse.urlencode(
                 {k: v for k, v in params.items() if v is not None}
@@ -395,6 +400,17 @@ class HttpClient:
                 info(_c(f"     body: {redacted}", "2"))
 
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        return url, request
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        form: dict[str, Any] | None = None,
+    ) -> tuple[int, Any, dict[str, str]]:
+        url, request = self._build_request(method, url, params, form)
 
         for attempt in range(4):
             try:
@@ -432,7 +448,7 @@ def _describe_http_error(method: str, url: str, status: int, payload: bytes) -> 
     detail = ""
     try:
         parsed = json.loads(payload)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         detail = payload.decode("utf-8", "replace").strip()
     else:
         if isinstance(parsed, dict):
@@ -486,7 +502,7 @@ class GithubClient:
         query: dict[str, Any] | None = dict(params or {})
         query["per_page"] = 100
         while url:
-            status, payload, headers = self._http.request("GET", url, params=query)
+            _, payload, headers = self._http.request("GET", url, params=query)
             query = None  # subsequent URLs come fully formed from the Link header
             if isinstance(payload, list):
                 yield from (item for item in payload if isinstance(item, dict))
